@@ -1,0 +1,107 @@
+#!/bin/bash
+# =============================================================================
+# pre-commit hook: ファイルサイズ制限チェック
+# ARCHITECTURE.md のルールに基づき、コミット対象のファイル行数を検査する。
+# 既知の超過ファイル（技術的負債）は警告のみ、新規超過はエラーで拒否。
+# =============================================================================
+
+set -e
+
+# ── カラー定義 ──
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+# ── 既知の超過ファイル (技術的負債) ──
+# ARCHITECTURE.md セクション7 に対応。新規プロジェクトでは空。
+KNOWN_DEBT=(
+  # 例: "src/pages/admin/HeavyPage.tsx"
+)
+
+# ── 行数上限の定義 ──
+get_max_lines() {
+  local file="$1"
+  case "$file" in
+    src/pages/__tests__/*)      echo 500 ;;
+    src/pages/*)                echo 600 ;;
+    src/components/__tests__/*) echo 500 ;;
+    src/components/*)           echo 400 ;;
+    src/hooks/__tests__/*)      echo 500 ;;
+    src/hooks/*)                echo 300 ;;
+    src/utils/__tests__/*)      echo 500 ;;
+    src/utils/*)                echo 250 ;;
+    src/types/*)                echo 400 ;;
+    *)                          echo 9999 ;; # チェック対象外
+  esac
+}
+
+# ── 既知の負債かどうかチェック ──
+is_known_debt() {
+  local file="$1"
+  for debt in "${KNOWN_DEBT[@]}"; do
+    if [ "$file" = "$debt" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ── メイン処理 ──
+HAS_ERROR=0
+HAS_WARNING=0
+
+# コミット対象の .ts/.tsx ファイルを取得 (削除されたファイルは除外)
+FILES=$(git diff --cached --name-only --diff-filter=d -- '*.ts' '*.tsx' | grep '^src/' || true)
+
+if [ -z "$FILES" ]; then
+  exit 0
+fi
+
+echo ""
+echo -e "${GREEN}[pre-commit] ファイルサイズチェック${NC}"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+for file in $FILES; do
+  if [ ! -f "$file" ]; then
+    continue
+  fi
+
+  MAX=$(get_max_lines "$file")
+  if [ "$MAX" = "9999" ]; then
+    continue
+  fi
+
+  LINES=$(wc -l < "$file")
+
+  if [ "$LINES" -gt "$MAX" ]; then
+    if is_known_debt "$file"; then
+      echo -e "${YELLOW}  [WARN] ${file}: ${LINES} 行 (上限 ${MAX})  ← 技術的負債${NC}"
+      HAS_WARNING=1
+    else
+      echo -e "${RED}  [ERROR] ${file}: ${LINES} 行 (上限 ${MAX})${NC}"
+      echo -e "${RED}         → ARCHITECTURE.md のルールに従って分割してください${NC}"
+      HAS_ERROR=1
+    fi
+  fi
+done
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if [ "$HAS_ERROR" -eq 1 ]; then
+  echo ""
+  echo -e "${RED}[pre-commit] ファイルサイズ超過のため、コミットを拒否しました。${NC}"
+  echo -e "${RED}  → 'ARCHITECTURE.md' のセクション2を参照して分割してください。${NC}"
+  echo -e "${RED}  → 既知の負債は 'ARCHITECTURE.md' セクション7 に追記すれば警告に変更できます。${NC}"
+  echo ""
+  exit 1
+fi
+
+if [ "$HAS_WARNING" -eq 1 ]; then
+  echo ""
+  echo -e "${YELLOW}[pre-commit] 技術的負債ファイルに警告があります。次回改修時に対応を検討してください。${NC}"
+fi
+
+echo -e "${GREEN}[pre-commit] ファイルサイズチェック完了${NC}"
+echo ""
+exit 0

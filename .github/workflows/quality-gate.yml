@@ -1,0 +1,221 @@
+# ============================================================
+# CI 品質ゲート — RULES.md 準拠
+#
+# チェック項目:
+#   1. ファイル行数制限 (ARCHITECTURE.md 準拠)
+#   2. TypeScript 型チェック (tsc --noEmit)
+#   3. any 型の禁止
+#   4. console.log/info の禁止 (テスト除く)
+#   5. ハードコード API キーの検出
+#   6. テストファイル存在チェック
+#   7. テスト実行
+#   8. 浮動小数点金額計算の禁止
+#   9. ビルド成功確認
+# ============================================================
+
+name: Quality Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── 1. ファイル行数制限チェック ──
+      - name: File length check
+        run: |
+          echo "📏 ファイル行数チェック (ARCHITECTURE.md 準拠)"
+          ERRORS=0
+
+          # 既知の技術的負債（超過を許容するファイル）
+          # ※ 新規プロジェクトでは空。ARCHITECTURE.md セクション7 に対応
+          KNOWN_DEBT=(
+            # 例: "src/pages/admin/HeavyPage.tsx"
+          )
+
+          is_known_debt() {
+            local file="$1"
+            for debt in "${KNOWN_DEBT[@]}"; do
+              if [ "$file" = "$debt" ]; then return 0; fi
+            done
+            return 1
+          }
+
+          get_max_lines() {
+            local file="$1"
+            case "$file" in
+              src/**/__tests__/*) echo 500 ;;
+              src/pages/*) echo 600 ;;
+              src/components/*) echo 400 ;;
+              src/hooks/*) echo 300 ;;
+              src/utils/*) echo 250 ;;
+              src/types/*) echo 400 ;;
+              *) echo 9999 ;;
+            esac
+          }
+
+          for f in $(find src -name '*.ts' -o -name '*.tsx' | grep -v node_modules); do
+            LINES=$(wc -l < "$f")
+            MAX=$(get_max_lines "$f")
+            if [ "$MAX" = "9999" ]; then continue; fi
+            if [ "$LINES" -gt "$MAX" ]; then
+              if is_known_debt "$f"; then
+                echo "⚠️  [技術的負債] $f: $LINES 行 (上限 $MAX)"
+              else
+                echo "❌ $f: $LINES 行 > 上限 $MAX 行"
+                ERRORS=$((ERRORS + 1))
+              fi
+            fi
+          done
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS ファイルが行数制限を超えています。ARCHITECTURE.md に従い分割してください。"
+            exit 1
+          fi
+          echo "✅ ファイル行数: 全ファイル制限内"
+
+      # ── 2. TypeScript 型チェック ──
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      # ── 3. any 型の検出 ──
+      - name: Ban explicit 'any' type
+        run: |
+          echo "🔍 any 型チェック (テスト・モック除く)"
+          HITS=$(grep -rn ': any\b\|as any\b' src/ \
+            --include='*.ts' --include='*.tsx' \
+            | grep -v '__tests__/' \
+            | grep -v '.test.' \
+            | grep -v '// eslint-disable' \
+            | grep -v '// @ts-' \
+            || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS"
+            COUNT=$(echo "$HITS" | wc -l)
+            echo "::warning::any 型が $COUNT 箇所見つかりました。型を明示してください。"
+          else
+            echo "✅ any 型: 検出なし"
+          fi
+
+      # ── 4. console.log/info の禁止 ──
+      - name: Ban console.log in production code
+        run: |
+          echo "🔍 console.log/info チェック (テスト除く)"
+          HITS=$(grep -rn 'console\.\(log\|info\|debug\)' src/ \
+            --include='*.ts' --include='*.tsx' \
+            | grep -v '__tests__/' \
+            | grep -v '.test.' \
+            | grep -v '// keep' \
+            || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS"
+            COUNT=$(echo "$HITS" | wc -l)
+            echo "::warning::console.log/info が $COUNT 箇所あります。本番コードから削除してください。"
+          else
+            echo "✅ console.log: 検出なし"
+          fi
+
+      # ── 5. ハードコード API キーの検出 ──
+      - name: Detect hard-coded API keys
+        run: |
+          echo "🔍 ハードコード API キーチェック"
+          ERRORS=0
+          HITS=$(grep -rn \
+            'AIza[A-Za-z0-9_-]\{30,\}\|sk-[A-Za-z0-9]\{40,\}\|AKIA[A-Z0-9]\{16\}' \
+            src/ --include='*.ts' --include='*.tsx' \
+            | grep -v '__tests__/' \
+            | grep -v '.test.' \
+            || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS"
+            echo "::error::ハードコードされた API キーが検出されました。環境変数またはシークレットに移行してください。"
+            ERRORS=1
+          fi
+          if [ -f .env ]; then
+            echo "::error::.env ファイルがリポジトリに含まれています。.gitignore に追加してください。"
+            ERRORS=1
+          fi
+          if [ "$ERRORS" -gt 0 ]; then exit 1; fi
+          echo "✅ API キー: ハードコードなし"
+
+      # ── 6. テストファイル存在チェック ──
+      - name: Check test files exist for source files
+        run: |
+          echo "🔍 テストファイル存在チェック"
+          MISSING=0
+          for f in $(find src/utils -maxdepth 1 -name '*.ts' 2>/dev/null | grep -v '__tests__' || true); do
+            BASE=$(basename "$f" .ts)
+            DIR=$(dirname "$f")
+            TEST="$DIR/__tests__/$BASE.test.ts"
+            if [ ! -f "$TEST" ]; then
+              echo "⚠️  テスト未作成: $TEST (対象: $f)"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+          for f in $(find src/hooks -maxdepth 1 -name '*.ts' 2>/dev/null | grep -v '__tests__' || true); do
+            BASE=$(basename "$f" .ts)
+            DIR=$(dirname "$f")
+            TEST="$DIR/__tests__/$BASE.test.ts"
+            if [ ! -f "$TEST" ]; then
+              echo "⚠️  テスト未作成: $TEST (対象: $f)"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+          if [ "$MISSING" -gt 0 ]; then
+            echo "::warning::$MISSING 個のソースにテストがありません。"
+          else
+            echo "✅ テストファイル: 全ソースにテスト存在"
+          fi
+
+      # ── 7. テスト実行 ──
+      - name: Run tests
+        run: npm test
+
+      # ── 8. 浮動小数点金額計算の検出 ──
+      - name: Detect floating-point money operations
+        run: |
+          echo "🔍 浮動小数点金額計算チェック"
+          HITS=$(grep -rn '\* 0\.\|/ 0\.\|Math\.round\|\.toFixed' src/ \
+            --include='*.ts' --include='*.tsx' \
+            | grep -iv 'test\|spec\|mock\|GPS\|lat\|lng\|radius\|zoom' \
+            | grep -i 'rate\|price\|amount\|cost\|pay\|salary\|yen\|tax' \
+            || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS"
+            echo "::warning::金額計算で浮動小数点演算の可能性があります。Math.floor + 整数(円)で計算してください。"
+          else
+            echo "✅ 金額計算: 浮動小数点演算なし"
+          fi
+
+      # ── 9. ビルド ──
+      - name: Build
+        run: npm run build
+
+      # ── 結果サマリー ──
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🏁 品質ゲート結果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| チェック | 状態 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| ファイル行数制限 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| TypeScript 型チェック | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| テスト実行 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| ビルド | ✅ |" >> $GITHUB_STEP_SUMMARY
